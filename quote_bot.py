@@ -15,7 +15,7 @@ logging.basicConfig(
 )
 
 # 🔑 ЗАМЕНИ ЭТОТ ТОКЕН НА СВОЙ ОТ @BotFather!
-BOT_TOKEN = "8303803529:AAHsScCz8qT2CbMNZqeg2yd4bNEvbmcTZw8"
+BOT_TOKEN = "TOKEN"
 
 # Загрузка цитат из файла рядом с ботом
 def load_quotes(filename="quotes.txt"):
