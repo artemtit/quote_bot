@@ -54,8 +54,8 @@ def save_state(application):
 
         if 'user_queues' in application.bot_data:
             data['user_queues'] = {str(k): list(v) for k, v in application.bot_data['user_queues'].items()}
-        if 'user_stats' in application.bot_data:
-            data['user_stats'] = {str(k): v for k, v in application.bot_data['user_stats'].items()}
+        if 'user_history' in application.bot_data:
+            data['user_history'] = {str(k): v for k, v in application.bot_data['user_history'].items()}
 
         jobs_info = []
         for job in application.job_queue.jobs():
@@ -84,48 +84,37 @@ def load_state(application):
 
         if 'user_queues' in application.bot_data:
             application.bot_data['user_queues'] = {
-                int(k): deque(v) for k, v in data['user_queues'].items()
+                int(k): deque(v) for k, v in data.get('user_queues', {}).items()
             }
-        if 'user_stats' in application.bot_data:
-            application.bot_data['user_stats'] = {
-                int(k): v for k, v in data['user_stats'].items()
+        if 'user_history' in application.bot_data:
+            application.bot_data['user_history'] = {
+                int(k): v for k, v in data.get('user_history', {}).items()
             }
 
-        if 'scheduled_jobs' in application.bot_data:
-            for job_info in data['scheduled_jobs']:
-                chat_id = int(job_info["chat_id"])
-                job_type = job_info["type"]
-                time_str = job_info.get("time")
+        for job_info in data.get('scheduled_jobs', []):
+            chat_id = int(job_info["chat_id"])
+            job_type = job_info["type"]
+            time_str = job_info.get("time")
 
-                if job_type == "hourly":
-                    application.job_queue.run_repeating(
-                        send_quote_job,
-                        interval=3600,
-                        first=60,
-                        chat_id=chat_id,
-                        name=f"{chat_id}_hourly",
-                        data={"chat_id": chat_id, "job_type": "hourly"}
-                    )
-                elif job_type == "daily" and time_str:
-                    hour, minute = map(int, time_str.split(":"))
-                    send_time = time(hour=hour, minute=minute, tzinfo=MOSCOW_TZ)
-                    application.job_queue.run_daily(
-                        send_quote_job,
-                        time=send_time,
-                        chat_id=chat_id,
-                        name=f"{chat_id}_daily_{time_str.replace(':', '-')}",
-                        data={"chat_id": chat_id, "job_type": "daily", "time": time_str}
-                    )
-                elif job_type == "custom" and time_str:
-                    hour, minute = map(int, time_str.split(":"))
-                    send_time = time(hour=hour, minute=minute, tzinfo=MOSCOW_TZ)
-                    application.job_queue.run_daily(
-                        send_quote_job,
-                        time=send_time,
-                        chat_id=chat_id,
-                        name=f"{chat_id}_custom_{time_str.replace(':', '-')}",
-                        data={"chat_id": chat_id, "job_type": "custom", "time": time_str}
-                    )
+            if job_type == "hourly":
+                application.job_queue.run_repeating(
+                    send_quote_job,
+                    interval=3600,
+                    first=60,
+                    chat_id=chat_id,
+                    name=f"{chat_id}_hourly",
+                    data={"chat_id": chat_id, "job_type": "hourly"}
+                )
+            elif job_type in ("daily", "custom") and time_str:
+                hour, minute = map(int, time_str.split(":"))
+                send_time = time(hour=hour, minute=minute, tzinfo=MOSCOW_TZ)
+                application.job_queue.run_daily(
+                    send_quote_job,
+                    time=send_time,
+                    chat_id=chat_id,
+                    name=f"{chat_id}_{job_type}_{time_str.replace(':', '-')}",
+                    data={"chat_id": chat_id, "job_type": job_type, "time": time_str}
+                )
 
         logger.info("Состояние загружено из %s", STATE_FILE)
     except FileNotFoundError:
@@ -144,18 +133,20 @@ def is_spamming(chat_id: int) -> bool:
     return False
 
 async def send_quote_to_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Отправляет цитату с кнопкой «Ещё»."""
+    """Отправляет цитату и сохраняет её в историю пользователя."""
     if not ALL_QUOTES:
         await context.bot.send_message(chat_id=chat_id, text="Цитаты закончились...")
         return
 
-    if 'user_queues' not in context.application.bot_data:
-        context.application.bot_data['user_queues'] = {}
-    if 'user_stats' not in context.application.bot_data:
-        context.application.bot_data['user_stats'] = {}
+    bot_data = context.application.bot_data
 
-    queues = context.application.bot_data['user_queues']
-    stats = context.application.bot_data['user_stats']
+    if 'user_queues' not in bot_data:
+        bot_data['user_queues'] = {}
+    if 'user_history' not in bot_data:
+        bot_data['user_history'] = {}
+
+    queues = bot_data['user_queues']
+    history = bot_data['user_history']
 
     if chat_id not in queues or not queues[chat_id]:
         shuffled = ALL_QUOTES.copy()
@@ -163,7 +154,11 @@ async def send_quote_to_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         queues[chat_id] = deque(shuffled)
 
     quote = queues[chat_id].popleft()
-    stats[chat_id] = stats.get(str(chat_id), 0) + 1
+
+    # Сохраняем историю — используем chat_id как int
+    if chat_id not in history:
+        history[chat_id] = []
+    history[chat_id].append(quote)
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -197,11 +192,39 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     )
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /stats — показывает статистику."""
-    chat_id = str(update.effective_chat.id)
-    stats_data = context.application.bot_data.get('user_stats', {})
-    count = stats_data.get(chat_id, 0)
-    await update.message.reply_text(f"📊 Ты получил(а) {count} цитат!")
+    """Показывает статистику."""
+    chat_id = update.effective_chat.id  # ← int, а не str!
+    history_data = context.application.bot_data.get('user_history', {})
+    count = len(history_data.get(chat_id, []))
+    await update.message.reply_text(
+        f"📊 Ты получил(а) **{count}** цитат!\n"
+        "Хочешь посмотреть все? Напиши /history"
+    )
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает историю полученных цитат."""
+    chat_id = update.effective_chat.id  # ← int!
+    history_data = context.application.bot_data.get('user_history', {})
+    user_history = history_data.get(chat_id, [])
+
+    if not user_history:
+        await update.message.reply_text("Ты ещё не получил(а) ни одной цитаты.")
+        return
+
+    chunks = []
+    current = ""
+    for i, q in enumerate(user_history, 1):
+        line = f"{i}. {q}\n\n"
+        if len(current) + len(line) > 3500:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        await update.message.reply_text(chunk)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка текстовых сообщений."""
@@ -210,7 +233,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text
-    chat_id = update.effective_chat.id
+    chat_id = update.effective_chat.id  # ← int
 
     if text == "✨ Получить цитату":
         await send_quote_to_user(context, chat_id)
@@ -351,6 +374,7 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("history", history))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(button_handler))
 
