@@ -1,31 +1,23 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║                     Цитатник от Артема                           ║
+║                     Цитатум от Артема                            ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Назначение: Telegram-бот для вдохновения цитатами               ║
-║  Возможности:                                                    ║
-║    • Случайные цитаты по запросу                                 ║
-║    • Ежедневная / ежечасная рассылка по московскому времени      ║
-║    • Персональное расписание рассылок                            ║
-║    • История всех полученных цитат                               ║
-║    • Статистика количества цитат                                 ║
-║    • Защита от спама                                             ║
-║    • Полное сохранение состояния между перезапусками             ║
-║                                                                  ║
-║  Технологии: Python, python-telegram-bot, pytz, dotenv           ║
-║  Автор: Артем at147824@gmail.com                                 ║
-║  Версия: 1.0.0                                                   ║
-║  Дата создания: 04.11.2025                                       ║
+║  Новые возможности:                                              ║
+║    • Тематические цитаты (мотивация, любовь, мудрость, жизнь)   ║
+║    • Выбор нескольких тем                                        ║
+║    • Красивое оформление с авторами                              ║
+║    • Всё остальное (рассылки, статистика, приватность)           ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
-import random
 import os
 import re
 import logging
 import json
-import atexit
+import signal
+import sys
 from datetime import time
-from collections import defaultdict, deque
+from collections import defaultdict
 import pytz
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -48,105 +40,118 @@ if not BOT_TOKEN:
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 STATE_FILE = "bot_state.json"
 
-ALL_QUOTES = []
+# Темы и их эмодзи
+THEMES = {
+    "motivation": "💪 Мотивация",
+    "love": "❤️ Любовь",
+    "wisdom": "🧠 Мудрость",
+    "life": "🌱 Жизнь"
+}
+
+# Глобальные переменные
+ALL_QUOTES = {}
 USER_STATE = {}
 USER_MESSAGE_TIMES = defaultdict(list)
 
-# === Вспомогательные функции ===
-def load_quotes(filename="quotes.txt"):
+# === Загрузка цитат по темам ===
+def load_quotes():
+    quotes = {}
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    file_path = os.path.join(current_dir, filename)
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            quotes = [line.strip() for line in f if line.strip()]
-        return quotes
-    except FileNotFoundError:
-        return ["Файл quotes.txt не найден. Создай его рядом с bot.py!"]
+    for theme in THEMES:
+        file_path = os.path.join(current_dir, f"quotes_{theme}.txt")
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = [line.strip() for line in f if line.strip()]
+                quotes[theme] = lines
+                logger.info(f"Загружено {len(lines)} цитат для темы '{theme}'")
+        except FileNotFoundError:
+            quotes[theme] = [f"Файл quotes_{theme}.txt не найден."]
+            logger.warning(f"Файл {file_path} не найден.")
+    return quotes
 
+# === Сохранение и загрузка состояния ===
 def save_state(application):
-    """Сохраняет ВСЁ состояние: очереди, историю, рассылки."""
     try:
         data = {}
 
-        # Сохраняем очереди цитат
-        queues = application.bot_data.get('user_queues', {})
-        data['user_queues'] = {str(k): list(v) for k, v in queues.items()}
+        # Статистика и выбор тем
+        if 'user_stats' in application.bot_data:
+            data['user_stats'] = application.bot_data['user_stats']
 
-        # 🔥 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: сохраняем историю цитат (статистика!)
-        history = application.bot_data.get('user_history', {})
-        data['user_history'] = {str(k): v for k, v in history.items()}
-
-        # Сохраняем информацию о рассылках
-        jobs_info = []
+        # Рассылки
+        scheduled_jobs = []
         for job in application.job_queue.jobs():
             if job.data and "chat_id" in job.data:
                 job_info = {
                     "chat_id": str(job.data["chat_id"]),
-                    "job_type": job.data.get("job_type", "unknown")
+                    "type": job.data.get("job_type", "unknown")
                 }
                 if job.data.get("time"):
                     job_info["time"] = job.data["time"]
-                jobs_info.append(job_info)
-        data['scheduled_jobs'] = jobs_info
+                if job.data.get("themes"):
+                    job_info["themes"] = job.data["themes"]
+                scheduled_jobs.append(job_info)
+
+        data['scheduled_jobs'] = scheduled_jobs
 
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        logger.info("✅ Состояние сохранено в %s", STATE_FILE)
+        logger.info("Состояние сохранено.")
     except Exception as e:
-        logger.error("❌ Ошибка при сохранении состояния: %s", e)
+        logger.error("Ошибка сохранения: %s", e)
 
 def load_state(application):
-    """Загружает всё состояние при старте."""
+    application.bot_data.setdefault('user_stats', {})  # <-- Гарантируем наличие
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        bot_data = application.bot_data
+        if 'user_stats' in data:
+            application.bot_data['user_stats'] = {
+                int(k): {
+                    "count": v.get("count", 0),
+                    "selected_topics": v.get("selected_topics", list(THEMES.keys()))
+                }
+                for k, v in data['user_stats'].items()
+            }
 
-        # Загружаем очереди
-        queues_raw = data.get('user_queues', {})
-        bot_data['user_queues'] = {int(k): deque(v) for k, v in queues_raw.items()}
+        # Рассылки
+        if 'scheduled_jobs' in application.bot_data:
+            for job_info in data['scheduled_jobs']:
+                chat_id = int(job_info["chat_id"])
+                job_type = job_info["type"]
+                time_str = job_info.get("time")
+                themes = job_info.get("themes", list(THEMES.keys()))
 
-        # 🔥 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: загружаем историю (статистика!)
-        history_raw = data.get('user_history', {})
-        bot_data['user_history'] = {int(k): v for k, v in history_raw.items()}
+                if job_type == "hourly":
+                    application.job_queue.run_repeating(
+                        send_quote_job,
+                        interval=3600,
+                        first=60,
+                        chat_id=chat_id,
+                        name=f"{chat_id}_hourly",
+                        data={"chat_id": chat_id, "job_type": "hourly", "themes": themes}
+                    )
+                elif job_type in ("daily", "custom") and time_str:
+                    hour, minute = map(int, time_str.split(":"))
+                    send_time = time(hour=hour, minute=minute, tzinfo=MOSCOW_TZ)
+                    application.job_queue.run_daily(
+                        send_quote_job,
+                        time=send_time,
+                        chat_id=chat_id,
+                        name=f"{chat_id}_{job_type}_{time_str.replace(':', '-')}",
+                        data={"chat_id": chat_id, "job_type": job_type, "time": time_str, "themes": themes}
+                    )
 
-        # Восстанавливаем рассылки
-        for job_info in data.get('scheduled_jobs', []):
-            chat_id = int(job_info["chat_id"])
-            job_type = job_info["job_type"]
-            time_str = job_info.get("time")
-
-            if job_type == "hourly":
-                application.job_queue.run_repeating(
-                    send_quote_job,
-                    interval=3600,
-                    first=60,
-                    chat_id=chat_id,
-                    name=f"{chat_id}_hourly",
-                    data={"chat_id": chat_id, "job_type": "hourly"}
-                )
-            elif job_type in ("daily", "custom") and time_str:
-                hour, minute = map(int, time_str.split(":"))
-                send_time = time(hour=hour, minute=minute, tzinfo=MOSCOW_TZ)
-                application.job_queue.run_daily(
-                    send_quote_job,
-                    time=send_time,
-                    chat_id=chat_id,
-                    name=f"{chat_id}_{job_type}_{time_str.replace(':', '-')}",
-                    data={"chat_id": chat_id, "job_type": job_type, "time": time_str}
-                )
-
-        logger.info("✅ Состояние (включая историю цитат!) загружено из %s", STATE_FILE)
+        logger.info("Состояние загружено.")
     except FileNotFoundError:
-        logger.info("📁 Файл состояния не найден — инициализация с нуля.")
-        application.bot_data['user_queues'] = {}
-        application.bot_data['user_history'] = {}
+        logger.info("Файл состояния не найден — создаём новый.")
+        application.bot_data['user_stats'] = {}
     except Exception as e:
-        logger.error("❌ Ошибка загрузки состояния: %s", e)
-        application.bot_data['user_queues'] = {}
-        application.bot_data['user_history'] = {}
+        logger.error("Ошибка загрузки: %s", e)
+        application.bot_data['user_stats'] = {}
 
+# === Вспомогательные функции ===
 def is_spamming(chat_id: int) -> bool:
     import time
     now = time.time()
@@ -156,37 +161,68 @@ def is_spamming(chat_id: int) -> bool:
     USER_MESSAGE_TIMES[chat_id].append(now)
     return False
 
-async def send_quote_to_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+def parse_quote(quote_line: str):
+    """Разделяет цитату и автора по ' — ' или ' - '."""
+    if " — " in quote_line:
+        text, author = quote_line.rsplit(" — ", 1)
+    elif " - " in quote_line:
+        text, author = quote_line.rsplit(" - ", 1)
+    else:
+        text, author = quote_line, ""
+    return text.strip('“”"'), author.strip()
+
+def escape_markdown_v2(text: str) -> str:
+    """Экранирует спецсимволы для MarkdownV2."""
+    escape_chars = r'\_*[]()~`>#+-=|{}.!'
+    for char in escape_chars:
+        text = text.replace(char, '\\' + char)
+    return text
+
+async def send_quote_to_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, themes_list=None):
     if not ALL_QUOTES:
-        await context.bot.send_message(chat_id=chat_id, text="Цитаты закончились...")
+        await context.bot.send_message(chat_id=chat_id, text="Цитаты не загружены.")
         return
 
-    bot_data = context.application.bot_data
-    if 'user_queues' not in bot_data:
-        bot_data['user_queues'] = {}
-    if 'user_history' not in bot_data:
-        bot_data['user_history'] = {}
+    # Получаем или создаём статистику
+    stats = context.application.bot_data['user_stats'].setdefault(chat_id, {
+        "count": 0,
+        "selected_topics": list(THEMES.keys())
+    })
+    stats["count"] += 1
 
-    queues = bot_data['user_queues']
-    history = bot_data['user_history']
+    # Темы для выбора
+    available_themes = themes_list or stats.get("selected_topics", list(THEMES.keys()))
+    if not available_themes:
+        available_themes = list(THEMES.keys())
 
-    if chat_id not in queues or not queues[chat_id]:
-        shuffled = ALL_QUOTES.copy()
-        random.shuffle(shuffled)
-        queues[chat_id] = deque(shuffled)
+    # Выбираем случайную тему из доступных
+    import random
+    chosen_theme = random.choice(available_themes)
+    theme_quotes = ALL_QUOTES.get(chosen_theme, [])
+    if not theme_quotes:
+        await context.bot.send_message(chat_id=chat_id, text="Цитаты в этой теме закончились.")
+        return
 
-    quote = queues[chat_id].popleft()
+    quote_line = random.choice(theme_quotes)
+    text, author = parse_quote(quote_line)
 
-    # 🔥 Сохраняем в историю (это основа статистики!)
-    if chat_id not in history:
-        history[chat_id] = []
-    history[chat_id].append(quote)
+    # Форматируем
+    theme_name = THEMES[chosen_theme].split(" ", 1)[1]
+    emoji = THEMES[chosen_theme].split(" ", 1)[0]
+    author_str = f"\n— *{escape_markdown_v2(author)}*" if author else ""
+
+    message = (
+        f"{emoji} **{escape_markdown_v2(theme_name)}**\n\n"
+        f"*“{escape_markdown_v2(text)}”*"
+        f"{author_str}\n\n"
+    )
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"✨ {quote}",
+        text=message,
+        parse_mode="MarkdownV2",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Ещё цитату", callback_data="more_quote")]
+            [InlineKeyboardButton("🔄 Ещё цитату", callback_data="more_quote")],
         ])
     )
 
@@ -194,75 +230,54 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("✨ Получить цитату")],
-            [KeyboardButton("⏰ Ежедневно в 9:00")],
+            [KeyboardButton("📚 Выбрать темы")],
+            [KeyboardButton("⏰ Ежедневно в 7:00")],
             [KeyboardButton("🕒 Выбрать своё время")],
             [KeyboardButton("📅 Каждый час")],
-            [KeyboardButton("🛑 Управление рассылками")],
-            [KeyboardButton("📊 Статистика")],
+            [KeyboardButton("🛑 Управление рассылками"), KeyboardButton("📊 Статистика")],
         ],
-        resize_keyboard=True,
-        one_time_keyboard=False
+        resize_keyboard=True
     )
+
+def get_topics_keyboard(selected):
+    buttons = []
+    for theme_key, theme_name in THEMES.items():
+        mark = "✅" if theme_key in selected else "⬜"
+        buttons.append([InlineKeyboardButton(f"{mark} {theme_name}", callback_data=f"toggle_{theme_key}")])
+    buttons.append([InlineKeyboardButton("✔️ Готово", callback_data="topics_done")])
+    return InlineKeyboardMarkup(buttons)
 
 # === Обработчики ===
-async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    """Команда /start — расширенное приветствие."""
-    welcome_text = (
-        "✨ <b>Привет, путник вдохновения!</b>\n\n"
-        "Я — твой личный бот-цитатник, и моя миссия — дарить тебе мудрость, "
-        "мотивацию и немного тепла в любой момент дня. 🌤️\n\n"
-        "📚 <b>Что я умею?</b>\n"
-        "• Присылать случайные цитаты по запросу\n"
-        "• Рассылать цитаты <b>ежедневно в 9:00 по Москве</b>\n"
-        "• Отправлять цитату <b>каждый час</b> (если хочешь поток вдохновения!)\n"
-        "• Работать по <b>твоему расписанию</b> — укажи удобное время\n"
-        "• Запоминать <b>всю историю</b> полученных цитат\n"
-        "• Показывать <b>статистику</b> — сколько цитат ты уже получил(а)\n\n"
-        "Все рассылки и время указаны по <b>московскому часовому поясу (UTC+3)</b>.\n\n"
-        "💡 <i>Совет:</i> Нажми на кнопки ниже, чтобы начать!\n"
-        "А если захочешь остановить рассылку — просто выбери «Управление рассылками»."
-    )
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        welcome_text,
-        reply_markup=get_main_keyboard(),
-        parse_mode="HTML"
+        "Привет! 🌟 Я — бот вдохновляющих цитат.\n\n"
+        "Выбери темы, которые тебе интересны, и получай мудрость, мотивацию или любовь каждый день 💬",
+        reply_markup=get_main_keyboard()
     )
+
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id  # int
-    history_data = context.application.bot_data.get('user_history', {})
-    count = len(history_data.get(chat_id, []))
+    chat_id = update.effective_chat.id
+    stats_data = context.application.bot_data.get('user_stats', {}).get(chat_id, {})
+    count = stats_data.get("count", 0)
+    await update.message.reply_text(f"📊 Ты получил(а) {count} цитат!")
+
+async def show_topic_selector(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    # Гарантируем, что user_stats существует
+    context.application.bot_data.setdefault('user_stats', {})
+    stats = context.application.bot_data['user_stats'].setdefault(chat_id, {
+        "count": 0,
+        "selected_topics": list(THEMES.keys())
+    })
+    selected = stats.get("selected_topics", list(THEMES.keys()))
     await update.message.reply_text(
-        f"📊 Ты получил(а) {count} цитат!\n"
-        "Хочешь посмотреть все? Напиши /history"
+        "✅ Выбери темы, которые тебе интересны.\nМожно выбрать несколько:",
+        reply_markup=get_topics_keyboard(selected)
     )
-
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id  # int
-    history_data = context.application.bot_data.get('user_history', {})
-    user_history = history_data.get(chat_id, [])
-
-    if not user_history:
-        await update.message.reply_text("Ты ещё не получил(а) ни одной цитаты.")
-        return
-
-    chunks = []
-    current = ""
-    for i, q in enumerate(user_history, 1):
-        line = f"{i}. {q}\n\n"
-        if len(current) + len(line) > 3500:
-            chunks.append(current)
-            current = line
-        else:
-            current += line
-    if current:
-        chunks.append(current)
-
-    for chunk in chunks:
-        await update.message.reply_text(chunk)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_spamming(update.effective_chat.id):
-        await update.message.reply_text("⏳ Пожалуйста, не спами. Подожди немного.")
+        await update.message.reply_text("⏳ Не спами, пожалуйста.")
         return
 
     text = update.message.text
@@ -270,39 +285,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "✨ Получить цитату":
         await send_quote_to_user(context, chat_id)
+
+    elif text == "📚 Выбрать темы":
+        await show_topic_selector(update, context)
+
     elif text == "📊 Статистика":
         await stats(update, context)
+
     elif text == "📅 Каждый час":
         job_name = f"{chat_id}_hourly"
-        if any(j.name == job_name for j in context.job_queue.jobs()):
+        existing = [j for j in context.job_queue.jobs() if j.name == job_name]
+        if existing:
             await update.message.reply_text("✅ Рассылка «Каждый час» уже активна.")
         else:
+            user_stats_data = context.application.bot_data['user_stats'].get(chat_id, {})
+            themes = user_stats_data.get("selected_topics", list(THEMES.keys()))  # ← ИСПРАВЛЕНО
             context.job_queue.run_repeating(
                 send_quote_job,
                 interval=3600,
                 first=1,
                 chat_id=chat_id,
                 name=job_name,
-                data={"chat_id": chat_id, "job_type": "hourly"}
+                data={"chat_id": chat_id, "job_type": "hourly", "themes": themes}
             )
-            await update.message.reply_text("✅ Рассылка «Каждый час» включена (по Москве).")
-    elif text == "⏰ Ежедневно в 9:00":
-        job_name = f"{chat_id}_daily_09-00"
-        if any(j.name == job_name for j in context.job_queue.jobs()):
+            await update.message.reply_text("✅ Рассылка «Каждый час» включена (по МСК).")
+
+    elif text == "⏰ Ежедневно в 7:00":
+        job_name = f"{chat_id}_daily_07-00"
+        existing = [j for j in context.job_queue.jobs() if j.name == job_name]
+        if existing:
             await update.message.reply_text("✅ Рассылка уже активна.")
         else:
-            send_time = time(hour=9, minute=0, tzinfo=MOSCOW_TZ)
+            user_stats_data = context.application.bot_data['user_stats'].get(chat_id, {})
+            themes = user_stats_data.get("selected_topics", list(THEMES.keys()))  # ← ИСПРАВЛЕНО
+            send_time = time(hour=7, minute=0, tzinfo=MOSCOW_TZ)
             context.job_queue.run_daily(
                 send_quote_job,
                 time=send_time,
                 chat_id=chat_id,
                 name=job_name,
-                data={"chat_id": chat_id, "job_type": "daily", "time": "09:00"}
+                data={"chat_id": chat_id, "job_type": "daily", "time": "07:00", "themes": themes}
             )
-            await update.message.reply_text("✅ Ежедневная рассылка в 9:00 по Москве включена.")
+            await update.message.reply_text("✅ Ежедневная рассылка в 7:00 по МСК включена.")
+
     elif text == "🕒 Выбрать своё время":
         USER_STATE[chat_id] = "awaiting_time"
-        await update.message.reply_text("Напиши время в формате ЧЧ:ММ (по московскому времени).\nПример: 14:30")
+        await update.message.reply_text("Напиши время в формате ЧЧ:ММ (по МСК).\nПример: 14:30")
+
     elif text == "🛑 Управление рассылками":
         jobs = [j for j in context.job_queue.jobs() if j.data and j.data.get("chat_id") == chat_id]
         if not jobs:
@@ -310,12 +339,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             buttons = []
             for job in jobs:
-                job_type = job.data.get("job_type")
+                job_type = job.data.get("job_type", "unknown")
                 time_str = job.data.get("time", "")
-                label = "Каждый час" if job_type == "hourly" else f"В {time_str}"
+                if job_type == "hourly":
+                    label = "Каждый час"
+                else:
+                    label = f"В {time_str}"
                 buttons.append([InlineKeyboardButton(f"❌ {label}", callback_data=f"remove_{job.name}")])
             buttons.append([InlineKeyboardButton("❌ Отменить всё", callback_data="remove_all")])
-            await update.message.reply_text("Выбери рассылку для отключения:", reply_markup=InlineKeyboardMarkup(buttons))
+            await update.message.reply_text(
+                "Выбери рассылку для отключения:",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+
     else:
         if USER_STATE.get(chat_id) == "awaiting_time":
             del USER_STATE[chat_id]
@@ -325,18 +361,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if 0 <= hour <= 23 and 0 <= minute <= 59:
                         time_str = f"{hour:02d}:{minute:02d}"
                         job_name = f"{chat_id}_custom_{time_str.replace(':', '-')}"
-                        if any(j.name == job_name for j in context.job_queue.jobs()):
+                        existing = [j for j in context.job_queue.jobs() if j.name == job_name]
+                        if existing:
                             await update.message.reply_text(f"✅ Рассылка «В {time_str}» уже активна.")
                         else:
+                            user_stats_data = context.application.bot_data['user_stats'].get(chat_id, {})
+                            themes = user_stats_data.get("selected_topics", list(THEMES.keys()))  # ← ИСПРАВЛЕНО
                             send_time = time(hour=hour, minute=minute, tzinfo=MOSCOW_TZ)
                             context.job_queue.run_daily(
                                 send_quote_job,
                                 time=send_time,
                                 chat_id=chat_id,
                                 name=job_name,
-                                data={"chat_id": chat_id, "job_type": "custom", "time": time_str}
+                                data={"chat_id": chat_id, "job_type": "custom", "time": time_str, "themes": themes}
                             )
-                            await update.message.reply_text(f"✅ Рассылка «В {time_str} по Москве» включена.")
+                            await update.message.reply_text(f"✅ Рассылка «В {time_str} по МСК» включена.")
                     else:
                         raise ValueError
                 except ValueError:
@@ -348,7 +387,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_quote_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
-    await send_quote_to_user(context, chat_id)
+    themes = context.job.data.get("themes", list(THEMES.keys()))
+    await send_quote_to_user(context, chat_id, themes)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -358,13 +398,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "more_quote":
         await send_quote_to_user(context, chat_id)
+
     elif data == "remove_all":
         jobs = [j for j in context.job_queue.jobs() if j.data and j.data.get("chat_id") == chat_id]
         for job in jobs:
             job.schedule_removal()
         await query.edit_message_text(f"⏹ Отключено {len(jobs)} рассылок.")
+
     elif data.startswith("remove_"):
-        job_name = data[7:]  # remove_
+        job_name = data.replace("remove_", "")
         jobs = [j for j in context.job_queue.jobs() if j.name == job_name]
         if jobs:
             jobs[0].schedule_removal()
@@ -372,26 +414,53 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("Рассылка уже отключена.")
 
+    elif data == "topics_done":
+        await query.edit_message_text("✅ Темы сохранены! Теперь ты будешь получать цитаты только по выбранным темам.")
+    
+    elif data.startswith("toggle_"):
+        theme_key = data.replace("toggle_", "")
+        if theme_key in THEMES:
+            stats = context.application.bot_data['user_stats'].setdefault(chat_id, {
+                "count": 0,
+                "selected_topics": list(THEMES.keys())
+            })
+            selected = stats.setdefault("selected_topics", list(THEMES.keys()))
+            if theme_key in selected:
+                selected.remove(theme_key)
+            else:
+                selected.append(theme_key)
+            # Обновляем сообщение
+            await query.edit_message_reply_markup(reply_markup=get_topics_keyboard(selected))
+
 # === Запуск ===
 def main():
     global ALL_QUOTES
     ALL_QUOTES = load_quotes()
 
     application = Application.builder().token(BOT_TOKEN).build()
-
-    # Инициализация с сохранением через atexit
     load_state(application)
-    atexit.register(save_state, application)
 
-    # Обработчики
+    def signal_handler(signum, frame):
+        logger.info("Получен сигнал завершения. Сохраняем состояние...")
+        save_state(application)
+        logger.info("Бот остановлен.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("history", history))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(button_handler))
 
-    logger.info("🚀 Бот запущен. Все данные сохраняются в %s", STATE_FILE)
-    application.run_polling()
+    logger.info("Бот запущен!")
+    try:
+        application.run_polling()
+    except KeyboardInterrupt:
+        logger.info("Принудительная остановка (Ctrl+C). Сохраняем состояние...")
+        save_state(application)
+        logger.info("Бот остановлен.")
 
 if __name__ == "__main__":
     main()
