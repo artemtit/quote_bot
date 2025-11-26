@@ -1,0 +1,16 @@
+{
+  "user_stats": {
+    "2091126912": {
+      "count": 0,
+      "selected_topics": [
+        "motivation",
+        "love",
+        "wisdom",
+        "life"
+      ],
+      "lang": "ru",
+      "tz": "UTC+3"
+    }
+  },
+  "scheduled_jobs": []
+}
